@@ -27,202 +27,163 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Net;
-using System.Runtime.Serialization.Json;
+using System.Globalization;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Microsoft.IdentityModel.Clients.ActiveDirectory
 {
-    class AdalHttpClient
+    internal class HttpClientWrapper : IHttpClient
     {
-        private const string DeviceAuthHeaderName = "x-ms-PKeyAuth";
-        private const string DeviceAuthHeaderValue = "1.0";
-        private const string WwwAuthenticateHeader = "WWW-Authenticate";
-        private const string PKeyAuthName = "PKeyAuth";
-        private const int DelayTimePeriod = 1000;
+        private readonly string uri;
+        private int timeoutInMilliSeconds = 30000;
 
-        internal bool Resiliency = false;
-        internal bool RetryOnce = true;
-
-        public AdalHttpClient(string uri, CallState callState)
+        public HttpClientWrapper(string uri, CallState callState)
         {
-            this.RequestUri = CheckForExtraQueryParameter(uri);
-            this.Client = PlatformPlugin.HttpClientFactory.Create(RequestUri, callState);
+            this.uri = uri;
+            this.Headers = new Dictionary<string, string>();
             this.CallState = callState;
         }
 
-        internal string RequestUri { get; set; }
+        protected CallState CallState { get; set; }
 
-        public IHttpClient Client { get; private set; }
+        public IRequestParameters BodyParameters { get; set; }
 
-        public CallState CallState { get; private set; }
+        public string Accept { get; set; }
 
-        public async Task<T> GetResponseAsync<T>(string endpointType)
+        public string ContentType { get; set; }
+
+        public bool UseDefaultCredentials { get; set; }
+
+        public Dictionary<string, string> Headers { get; private set; }
+
+        public int TimeoutInMilliSeconds
         {
-            return await this.GetResponseAsync<T>(endpointType, true);
+            set
+            {
+                this.timeoutInMilliSeconds = value;
+            }
         }
 
-        private async Task<T> GetResponseAsync<T>(string endpointType, bool respondToDeviceAuthChallenge)
-        { 
-            T typedResponse = default(T);
-            IHttpWebResponse response;
-            ClientMetrics clientMetrics = new ClientMetrics();
-
-            try
+        public async Task<IHttpWebResponse> GetResponseAsync()
+        {
+            using (HttpClient client = new HttpClient(HttpMessageHandlerFactory.GetMessageHandler(this.UseDefaultCredentials)))
             {
-                clientMetrics.BeginClientMetricsRecord(this.CallState);
+                client.DefaultRequestHeaders.Accept.Clear();
+                HttpRequestMessage requestMessage = new HttpRequestMessage();
+                requestMessage.RequestUri = new Uri(uri);
+                requestMessage.Headers.Accept.Clear();
 
-                if (PlatformPlugin.HttpClientFactory.AddAdditionalHeaders)
+                requestMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(this.Accept ?? "application/json"));
+                foreach (KeyValuePair<string, string> kvp in this.Headers)
                 {
-                    Dictionary<string, string> clientMetricsHeaders = clientMetrics.GetPreviousRequestRecord(this.CallState);
-                    foreach (KeyValuePair<string, string> kvp in clientMetricsHeaders)
-                    {
-                        this.Client.Headers[kvp.Key] = kvp.Value;
-                    }
-
-                    IDictionary<string, string> adalIdHeaders = AdalIdHelper.GetAdalIdParameters();
-                    foreach (KeyValuePair<string, string> kvp in adalIdHeaders)
-                    {
-                        this.Client.Headers[kvp.Key] = kvp.Value;
-                    }
+                    requestMessage.Headers.Add(kvp.Key, kvp.Value);
                 }
 
-                //add pkeyauth header
-                this.Client.Headers[DeviceAuthHeaderName] = DeviceAuthHeaderValue;
-                using (response = await this.Client.GetResponseAsync())
+                bool addCorrelationId = (this.CallState != null && this.CallState.CorrelationId != Guid.Empty);
+                if (addCorrelationId)
                 {
-                    typedResponse = DeserializeResponse<T>(response.ResponseStream);
-                    clientMetrics.SetLastError(null);
+                    requestMessage.Headers.Add(OAuthHeader.CorrelationId, this.CallState.CorrelationId.ToString());
+                    requestMessage.Headers.Add(OAuthHeader.RequestCorrelationIdInResponse, "true");
                 }
-            }
-            catch (HttpRequestWrapperException ex)
-            {
-                if (ex.InnerException is TaskCanceledException)
-                {
-                    Resiliency = true;
-                    PlatformPlugin.Logger.Information(this.CallState, ex.InnerException + "Network timeout..Client Resiliency feature enabled..");
-                }
-                if (!this.isDeviceAuthChallenge(endpointType, ex.WebResponse, respondToDeviceAuthChallenge))
-                {
-                    AdalServiceException serviceEx;
-                    if (ex.WebResponse != null)
-                    {
-                        TokenResponse tokenResponse = TokenResponse.CreateFromErrorResponse(ex.WebResponse);
-                        string[] errorCodes = tokenResponse.ErrorCodes ?? new[] {ex.WebResponse.StatusCode.ToString()};
-                        serviceEx = new AdalServiceException(tokenResponse.Error, tokenResponse.ErrorDescription,
-                            errorCodes, ex);
 
-                        if ((ex.WebResponse.StatusCode.Equals(HttpStatusCode.InternalServerError)) ||
-                            (ex.WebResponse.StatusCode).Equals(HttpStatusCode.GatewayTimeout) ||
-                            (ex.WebResponse.StatusCode).Equals(HttpStatusCode.ServiceUnavailable))
+                client.Timeout = TimeSpan.FromMilliseconds(this.timeoutInMilliSeconds);
+
+                HttpResponseMessage responseMessage;
+
+                try
+                {
+                    if (this.BodyParameters != null)
+                    {
+                        HttpContent content;
+                        if (this.BodyParameters is StringRequestParameters)
                         {
-                            if (RetryOnce)
-                            {
-                                await Task.Delay(DelayTimePeriod);
-                                RetryOnce = false;
-                                PlatformPlugin.Logger.Information(this.CallState, "WebResponse is not a success due to :-" + ex.InnerException + "Retrying one more time..");
-                                return await this.GetResponseAsync<T>(endpointType, respondToDeviceAuthChallenge);
-                            }
-                                Resiliency = true;
-                                PlatformPlugin.Logger.Information(this.CallState,ex.InnerException + "Retry Failed.Client Resiliency feature enabled");
+                            content = new StringContent(this.BodyParameters.ToString(), Encoding.UTF8, this.ContentType);
                         }
+                        else
+                        {
+                            content = new FormUrlEncodedContent(((DictionaryRequestParameters)this.BodyParameters).ToList());
+                        }
+
+                        requestMessage.Method = HttpMethod.Post;
+                        requestMessage.Content = content;
                     }
                     else
                     {
-                        serviceEx = new AdalServiceException(AdalError.Unknown, ex);
+                        requestMessage.Method = HttpMethod.Get;
                     }
 
-                    clientMetrics.SetLastError(serviceEx.ServiceErrorCodes);
-                    PlatformPlugin.Logger.Error(CallState, serviceEx);
-                    throw serviceEx;
+                    responseMessage = await client.SendAsync(requestMessage).ConfigureAwait(false);
                 }
-                else
+                catch (TaskCanceledException ex)
                 {
-                    response = ex.WebResponse;
+                    throw new HttpRequestWrapperException(null, ex);
+                }
+
+                IHttpWebResponse webResponse = await CreateResponseAsync(responseMessage);
+
+                if (!responseMessage.IsSuccessStatusCode)
+                {
+                    try
+                    {
+                        throw new HttpRequestException(string.Format(CultureInfo.CurrentCulture, " Response status code does not indicate success: {0} ({1}).", (int)webResponse.StatusCode, webResponse.StatusCode));
+                    }
+                    catch (HttpRequestException ex)
+                    {
+                        webResponse.ResponseStream.Position = 0;
+                        throw new HttpRequestWrapperException(webResponse, ex);
+                    }
+                }
+
+                if (addCorrelationId)
+                {
+                    VerifyCorrelationIdHeaderInReponse(webResponse.Headers);
+                }
+
+                return webResponse;
+            }
+        }
+
+        public async static Task<IHttpWebResponse> CreateResponseAsync(HttpResponseMessage response)
+        {
+            var headers = new Dictionary<string, string>();
+            if (response.Headers != null)
+            {
+                foreach (var kvp in response.Headers)
+                {
+                    headers[kvp.Key] = kvp.Value.First();
                 }
             }
-            finally
-            {
-                clientMetrics.EndClientMetricsRecord(endpointType, this.CallState);
-            }
-                
-            //check for pkeyauth challenge
-            if (this.isDeviceAuthChallenge(endpointType, response, respondToDeviceAuthChallenge))
-            {
-                return await HandleDeviceAuthChallenge<T>(endpointType, response);
-            }
 
-            return typedResponse;
+            return new HttpWebResponseWrapper(await response.Content.ReadAsStreamAsync(), headers, response.StatusCode);
         }
 
-
-        private bool isDeviceAuthChallenge(string endpointType, IHttpWebResponse response, bool respondToDeviceAuthChallenge)
+        private void VerifyCorrelationIdHeaderInReponse(Dictionary<string, string> headers)
         {
-            return PlatformPlugin.DeviceAuthHelper.CanHandleDeviceAuthChallenge &&
-                   respondToDeviceAuthChallenge && response != null &&
-                   (response.Headers.ContainsKey(WwwAuthenticateHeader) &&
-                    response.Headers[WwwAuthenticateHeader].StartsWith(PKeyAuthName, StringComparison.CurrentCulture)) &&
-                   endpointType.Equals(ClientMetricsEndpointType.Token);
-        }
-
-        private IDictionary<string, string> ParseChallengeData(IHttpWebResponse response)
-        {
-            IDictionary<string, string> data = new Dictionary<string, string>();
-            string wwwAuthenticate = response.Headers[WwwAuthenticateHeader];
-            wwwAuthenticate = wwwAuthenticate.Substring(PKeyAuthName.Length + 1);
-            List<string> headerPairs = EncodingHelper.SplitWithQuotes(wwwAuthenticate, ',');
-            foreach (string pair in headerPairs)
+            foreach (string reponseHeaderKey in headers.Keys)
             {
-                List<string> keyValue = EncodingHelper.SplitWithQuotes(pair, '=');
-                data.Add(keyValue[0].Trim(),keyValue[1].Trim().Replace("\"",""));
+                string trimmedKey = reponseHeaderKey.Trim();
+                if (string.Compare(trimmedKey, OAuthHeader.CorrelationId, StringComparison.OrdinalIgnoreCase) == 0)
+                {
+                    string correlationIdHeader = headers[trimmedKey].Trim();
+                    Guid correlationIdInResponse;
+                    if (!Guid.TryParse(correlationIdHeader, out correlationIdInResponse))
+                    {
+                        PlatformPlugin.Logger.Warning(CallState, string.Format(CultureInfo.CurrentCulture, "Returned correlation id '{0}' is not in GUID format.", correlationIdHeader));
+                    }
+                    else if (correlationIdInResponse != this.CallState.CorrelationId)
+                    {
+                        PlatformPlugin.Logger.Warning(
+                            this.CallState,
+                            string.Format(CultureInfo.CurrentCulture, "Returned correlation id '{0}' does not match the sent correlation id '{1}'", correlationIdHeader, CallState.CorrelationId));
+                    }
+
+                    break;
+                }
             }
-
-            return data;
-        }
-
-        private async Task<T> HandleDeviceAuthChallenge<T>(string endpointType, IHttpWebResponse response)
-        {
-            IDictionary<string, string> responseDictionary = this.ParseChallengeData(response);
-
-            if (!responseDictionary.ContainsKey("SubmitUrl"))
-            {
-                responseDictionary["SubmitUrl"] = RequestUri;
-            }
-
-            string responseHeader = await PlatformPlugin.DeviceAuthHelper.CreateDeviceAuthChallengeResponse(responseDictionary);
-            IRequestParameters rp = this.Client.BodyParameters;
-            this.Client = PlatformPlugin.HttpClientFactory.Create(CheckForExtraQueryParameter(responseDictionary["SubmitUrl"]), this.CallState);
-            this.Client.BodyParameters = rp;
-            this.Client.Headers["Authorization"] = responseHeader;
-            return await this.GetResponseAsync<T>(endpointType, false);
-        }
-
-        private static T DeserializeResponse<T>(Stream responseStream)
-        {
-            DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(T));
-
-            if (responseStream == null)
-            {
-                return default(T);
-            }
-
-            using (Stream stream = responseStream)
-            {
-                return ((T)serializer.ReadObject(stream));
-            }
-        }
-
-        private static string CheckForExtraQueryParameter(string url)
-        {
-            string extraQueryParameter = PlatformPlugin.PlatformInformation.GetEnvironmentVariable("ExtraQueryParameter");
-            string delimiter = (url.IndexOf('?') > 0) ? "&" : "?";
-            if (!string.IsNullOrWhiteSpace(extraQueryParameter))
-            {
-                url += string.Concat(delimiter, extraQueryParameter);
-            }
-
-            return url;
         }
     }
 }
